@@ -65,7 +65,7 @@ with db() as con:
 
 
 # AI MODEL
-MODEL_PATH = ("best.pt)
+MODEL_PATH = Path(__file__).resolve().parent / "best.pt"
 @st.cache_resource
 def load_model():
     if MODEL_PATH.exists():
