@@ -65,7 +65,9 @@ with db() as con:
 
 
 # AI MODEL
-MODEL_PATH = Path(__file__).resolve().parent / "best.pt"
+MODEL_PATH = Path("models/best.pt")
+
+
 @st.cache_resource
 def load_model():
     if MODEL_PATH.exists():
@@ -76,6 +78,21 @@ def load_model():
 # DESIGN
 st.markdown("""
 <style>
+footer {
+    visibility: hidden;
+}
+
+header[data-testid="stHeader"] {
+    visibility: hidden;
+}
+
+.stDeployButton {
+    display: none;
+}
+
+[data-testid="stToolbar"] {
+    visibility: hidden;
+}
 .stApp {
     background: linear-gradient(135deg,#10152b,#172554,#241342);
     color: white;
