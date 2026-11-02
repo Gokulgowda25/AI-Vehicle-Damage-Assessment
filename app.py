@@ -65,8 +65,7 @@ with db() as con:
 
 
 # AI MODEL
-MODEL_PATH = Path(
-    "best.pt"
+MODEL_PATH = ("best.pt
 )
 
 
