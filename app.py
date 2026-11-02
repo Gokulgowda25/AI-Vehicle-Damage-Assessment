@@ -66,7 +66,7 @@ with db() as con:
 
 # AI MODEL
 MODEL_PATH = Path(
-    "runs/detect/models/vehicle_damage/weights/best.pt"
+    "models/best.pt"
 )
 
 
