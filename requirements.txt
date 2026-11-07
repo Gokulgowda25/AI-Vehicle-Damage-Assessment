@@ -2,5 +2,9 @@ streamlit
 ultralytics
 opencv-python-headless
 pillow
+pillow-heif
 numpy
+pandas
 reportlab
+bcrypt
+qrcode[pil]
