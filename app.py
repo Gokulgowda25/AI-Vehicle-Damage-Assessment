@@ -20,7 +20,7 @@ from PIL import Image, ImageOps
 from ultralytics import YOLO
 
 from severity import assess_severity
-from cost_estimation import estimate_repair_cost
+from cost_estimation import estimate_repair_cost, estimate_from_detections as get_estimate, LABOUR_RATE
 
 
 # ============================================================
@@ -127,6 +127,8 @@ def migrate_database():
     add("reports", "email", "TEXT")
     add("mechanics", "available", "INTEGER DEFAULT 1")
     add("mechanics", "price_list", "TEXT")
+    add("quotes", "seen", "INTEGER DEFAULT 0")
+    add("messages", "seen", "INTEGER DEFAULT 0")
     conn.execute("""CREATE TABLE IF NOT EXISTS photos (
         id INTEGER PRIMARY KEY AUTOINCREMENT, report_id INTEGER, mechanic_id INTEGER,
         kind TEXT, image BLOB, created TEXT)""")
@@ -207,12 +209,34 @@ def load_yolo_model():
     return None
 
 
-IST = timezone(timedelta(hours=5, minutes=30))
+try:
+    from zoneinfo import ZoneInfo
+    IST = ZoneInfo("Asia/Kolkata")
+except Exception:                                    # tz database missing: India has no DST, so a fixed offset is exact
+    IST = timezone(timedelta(hours=5, minutes=30))
+TS_FORMAT = "%d-%b-%Y, %I:%M %p"                     # e.g. 05-Nov-2026, 08:25 PM
+_OLD_TS_FORMATS = ("%d-%m-%Y %I:%M %p", TS_FORMAT)
 
 
 def now_ist():
     """Current India time (Streamlit Cloud servers run on UTC)."""
-    return datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+    return datetime.now(IST).strftime(TS_FORMAT)
+
+
+def parse_ts(value):
+    """Parse a stored timestamp (old or new format). Returns a datetime or None."""
+    for fmt in _OLD_TS_FORMATS:
+        try:
+            return datetime.strptime(str(value).strip(), fmt)
+        except Exception:
+            continue
+    return None
+
+
+def pretty_ts(value):
+    """Show any stored timestamp in the standard Indian format: 05-Nov-2026, 08:25 PM."""
+    dt = parse_ts(value)
+    return dt.strftime(TS_FORMAT) if dt else (str(value) if value else "-")
 
 
 def load_image(image_bytes):
@@ -772,7 +796,7 @@ def build_pdf(rep):
             ("Vehicle", rep["vehicle"]), ("Damage", str(rep["damage"]).replace("_", " ").title()),
             ("Severity", rep["severity"]),
             ("AI estimate", f"Rs {int(rep['min_cost'] or 0):,} - Rs {int(rep['max_cost'] or 0):,}"),
-            ("Created", rep["created"])]
+            ("Created", pretty_ts(rep["created"]))]
     for k, v in rows:
         y -= 22
         c.setFont("Helvetica-Bold", 12)
@@ -846,7 +870,7 @@ def build_journey_pdf(report_id):
 
     S.append(Paragraph("1. Vehicle and customer details", h))
     S.append(tbl([["Customer", report["customer"]], ["Phone", report["phone"]], ["Area", report["area"]],
-                  ["Vehicle", report["vehicle"]], ["Report created", report["created"]]],
+                  ["Vehicle", report["vehicle"]], ["Report created", pretty_ts(report["created"])]],
                  [40 * mm, W - 40 * mm], head=False))
 
     S.append(Paragraph("2. AI inspection result", h))
@@ -941,59 +965,222 @@ def _secret(name):
     return val or os.environ.get(name)
 
 
-def assistant_rules(q, ctx):
-    """Offline assistant: keyword answers using the report/quote context."""
-    t = q.lower()
-    has = lambda *w: any(x in t for x in w)
+def _kw_score(t, kws):
+    """Score = total length of matched keywords. Phrases match as text; short words match whole words;
+    longer words match as prefixes (repair -> repairing)."""
+    score = 0
+    for k in kws:
+        if " " in k:
+            hit = k in t
+        elif len(k) <= 3:
+            hit = re.search(r"\b" + re.escape(k) + r"\b", t) is not None
+        else:
+            hit = re.search(r"\b" + re.escape(k), t) is not None
+        if hit:
+            score += len(k)
+    return score
+
+
+_INTENTS = [
+    ("greet", ["hi", "hello", "hey", "namaste", "good morning", "good evening", "good afternoon"]),
+    ("thanks", ["thank", "thanks", "thx", "appreciate"]),
+    ("bye", ["bye", "goodbye", "see you"]),
+    ("start", ["want repair", "want to repair", "need repair", "need to repair", "repair my", "repair the car",
+               "repair car", "fix my", "fix the car", "car repair", "my car is damaged", "car damaged",
+               "car got damaged", "accident", "hit my car", "scratched my car", "dented my car", "get my car",
+               "how to start", "how do i start", "where do i start", "what should i do", "what do i do",
+               "need help", "help me", "get started"]),
+    ("dashboard", ["dashboard", "dashbord", "dash board", "warning light", "check engine", "engine light",
+                   "abs light", "oil light"]),
+    ("howapp", ["how does this work", "how it works", "how does it work", "how to use", "what is this",
+                "what can you do", "about this app", "this app", "the app", "app work", "autovision", "features", "tutorial", "explain the app",
+                "five pages", "portals"]),
+    ("upload", ["upload", "photo", "picture", "image", "camera", "gallery", "heic", "not detecting",
+                "no damage", "nothing detected", "blurry", "detect"]),
+    ("reportid", ["report id", "forgot id", "lost id", "where is my id", "my id", "report number", "case id"]),
+    ("account", ["register", "login", "log in", "logout", "log out", "password", "sign up", "sign in",
+                 "my account", "registration"]),
+    ("mech_quote", ["send quote", "submit quote", "give quote", "my quote", "withdraw", "as a mechanic",
+                    "i am a mechanic", "i'm a mechanic", "workshop owner"]),
+    ("choose_quote", ["which quote", "which mechanic", "best quote", "best mechanic", "choose", "compare",
+                      "recommended", "select mechanic", "which one"]),
+    ("quotes_flow", ["quote", "quotation", "offer", "bids"]),
+    ("cost", ["cost", "price", "estimate", "how much", "expensive", "charge", "budget", "rupee", "rs "]),
+    ("worth", ["worth", "replace", "repair or", "should i repair", "is it necessary"]),
+    ("drive", ["drive", "driving", "safe", "tow", "towing", "road"]),
+    ("time", ["how long", "time", "days", "when will", "ready", "duration", "delay"]),
+    ("insurance", ["insurance", "claim", "policy", "cashless"]),
+    ("warranty", ["warranty", "guarantee", "guaranty"]),
+    ("paint", ["paint", "colour", "color", "polish", "touch-up", "touch up"]),
+    ("scratch", ["scratch", "scuff", "scrape"]),
+    ("dent", ["dent", "deformation", "deformed", "bent", "pushed in"]),
+    ("crack", ["crack", "hole", "windshield", "windscreen", "glass", "shatter"]),
+    ("lamp", ["lamp", "headlight", "taillight", "tail light", "indicator", "bumper"]),
+    ("severity", ["severity", "slight", "severe", "medium damage", "what does severity", "how bad"]),
+    ("accuracy", ["accurate", "accuracy", "reliable", "trust", "correct", "wrong", "mistake", "confidence"]),
+    ("review", ["review", "rating", "rate the", "feedback", "stars"]),
+    ("language", ["language", "kannada", "hindi", "translate", "english"]),
+    ("delete", ["delete", "remove report", "cancel report", "erase"]),
+    ("message", ["message", "chat with", "talk to", "contact the mechanic", "call the mechanic", "whatsapp"]),
+    ("map", ["map", "nearest", "near me", "nearby", "distance", "location", "where are"]),
+    ("pdf", ["pdf", "download", "share report", "print", "qr"]),
+    ("trouble", ["problem", "issue", "error", "not working", "bug", "stuck", "failed", "cannot", "can't", "doesn't work"]),
+]
+
+
+def _assistant_answer(intent, ctx, q):
     dmg, sev = ctx.get("damage"), ctx.get("severity")
     lo, hi = ctx.get("min_cost"), ctx.get("max_cost")
     quotes = ctx.get("quotes") or []
+    have = lo is not None
+    est_txt = (f"Rs {int(lo):,} to Rs {int(hi):,}" if hi else f"from Rs {int(lo):,}") if have else ""
 
-    if has("which quote", "which mechanic", "choose", "best quote", "select", "compare") and quotes:
-        cheap = min(quotes, key=lambda x: x["amount"])
-        fast = min(quotes, key=lambda x: x["days"] or 999)
-        return (f"The lowest quote is {cheap['name']} at Rs {int(cheap['amount']):,}. "
-                f"The fastest is {fast['name']} ({fast['days'] or '?'} days). Check the 'Recommended' badge, which balances "
-                "price, speed and rating, and compare each quote with the AI estimate bar before choosing.")
-    if has("cost", "price", "estimate", "how much", "expensive", "charge", "budget"):
-        if lo is not None:
-            hi_txt = f"Rs {int(hi):,}" if hi else "a manual inspection price"
-            return (f"For {dmg or 'this damage'}, the AI estimate is Rs {int(lo):,} to {hi_txt}. The final price depends on parts, "
-                    "paint and labour, so compare 2 or 3 quotations.")
-        return "Costs depend on damage type and severity. Run the analysis on your photo to get an estimated range."
-    if has("worth", "replace", "repair or"):
+    if intent == "greet":
+        return "Hi! I'm the AutoVision assistant. Ask me about repair cost, time, safety, insurance, or how to use this app."
+    if intent == "thanks":
+        return "You're welcome! Ask me anything else about your repair."
+    if intent == "bye":
+        return "Bye! Come back anytime to check your quotations."
+    if intent == "start":
+        if have:
+            return (f"You already analysed your photo: {dmg} ({sev}), estimate {est_txt}. Next: fill the share form below "
+                    "(name, phone, area, vehicle) and tap SHARE DAMAGE REPORT. Then open Quotations with your Report ID.")
+        return ("Here is how to get your car repaired with AutoVision:\n"
+                "1. Customer page: upload a clear photo and tap ANALYSE VEHICLE DAMAGE.\n"
+                "2. Check the AI result and estimate, then fill the form and SHARE DAMAGE REPORT. Note your Report ID.\n"
+                "3. Mechanics near you send quotations.\n"
+                "4. Quotations page: enter Report ID and phone, compare quotes and select a mechanic.")
+    if intent == "dashboard":
+        return ("Which dashboard do you mean?\n"
+                "• Car dashboard warning lights (engine, oil, ABS, battery): AutoVision can't read these. A mechanic with a "
+                "scanner must check them, and a red light means stop driving soon.\n"
+                "• App dashboards: the Mechanic dashboard is on the Mechanic page after login (requests, quotes, earnings). "
+                "The Admin dashboard is at the bottom of the About page and needs the admin password.")
+    if intent == "howapp":
+        return ("AutoVision has 5 pages: Home, Customer (upload a photo and get an AI damage estimate), Mechanic "
+                "(workshops register, see requests and send quotes), Quotations (compare offers and track the repair) and About. "
+                "Use the ⋮ menu at the top right for login, language and quick links.")
+    if intent == "upload":
+        return ("For a good result: take the photo in daylight, 1 to 2 metres away, with the whole damaged area in the frame and "
+                "no blur. JPG, PNG and HEIC are fine, and you can use the camera button. If it says no damage was found, try a "
+                "closer or clearer photo from another angle.")
+    if intent == "reportid":
+        return ("Your Report ID is shown after you share a report, and it is also in your PDF. If you lost it, open the Customer page "
+                "→ 'My previous reports' and enter your phone number to see all your report IDs.")
+    if intent == "account":
+        return ("Only workshops need an account. On the Mechanic page, register once with your name, mobile, area and password, "
+                "then log in (or use the ⋮ menu). Customers do not need to register. Forgot your password? Log in once and use "
+                "'Change password', or register a new account with a different number.")
+    if intent == "mech_quote":
+        return ("Mechanics: log in on the Mechanic page, open a request, enter parts, labour, paint, days and warranty, and press "
+                "SUBMIT / UPDATE QUOTATION. You can withdraw or update it any time before the customer selects you.")
+    if intent == "choose_quote":
+        if quotes:
+            cheap = min(quotes, key=lambda x: x["amount"])
+            fast = min(quotes, key=lambda x: x["days"] or 999)
+            return (f"The lowest quote is {cheap['name']} at Rs {int(cheap['amount']):,}. The fastest is {fast['name']} "
+                    f"({fast['days'] or '?'} days). Check the 'Recommended' badge, which balances price, speed and rating, "
+                    "and use the comparison table.")
+        return ("Quotations appear on the Quotations page once mechanics respond. Compare price, days, warranty and rating, and "
+                "look for the 'Recommended' badge.")
+    if intent == "quotes_flow":
+        if quotes:
+            return f"You have {len(quotes)} quotation(s). Use 'Compare side by side' to see parts, labour and paint, then select a mechanic."
+        return ("After you share your report, mechanics in your area can send quotations. Open the Quotations page, enter your "
+                "Report ID and phone number, and the offers will appear there with a 🔔 notice for new ones.")
+    if intent == "cost":
+        if have:
+            return (f"For {dmg or 'this damage'}, the AI estimate is {est_txt}. It depends on the damage type, its size, whether "
+                    "the part is repaired or replaced, labour and paint. Final price comes from the mechanic, so compare 2 or 3 quotes.")
+        return ("Upload a photo on the Customer page to get an estimate. Cost depends on the damage type, size, repair or "
+                "replacement, labour (about Rs 500 per hour) and paint. Slight scratches cost the least, severe dents the most.")
+    if intent == "worth":
         if sev:
-            return (f"With {sev} severity {dmg or 'damage'}, repair is usually cheaper than replacing the panel. "
-                    "Ask the mechanic if paintless dent repair or touch-up paint can work before agreeing to replacement.")
-        return "Repair is usually cheaper than replacement for dents and scratches. Replacement makes sense for cracked or buckled parts."
-    if has("drive", "safe", "tow"):
-        return drive_tip(sev) if sev else "Run the analysis first so I can give driving advice for your damage level."
-    if has("how long", "time", "days", "when will", "ready"):
+            return (f"For {sev} damage, repair is usually cheaper than replacing the panel. Ask the mechanic about paintless dent "
+                    "repair or touch-up paint first. Replacement makes sense for deep cracks, holes or badly bent panels.")
+        return "Repair is usually cheaper than replacement for dents and scratches; replace badly cracked or bent parts."
+    if intent == "drive":
+        return drive_tip(sev) if sev else ("Run the analysis first so I can advise on driving safety. In general, avoid driving with "
+                                           "cracked glass, loose parts, fluid leaks or broken lights.")
+    if intent == "time":
         if sev:
             a, b = repair_time(sev)
             return f"For {sev} damage, repairs usually take about {a} to {b} days. Each quotation also shows the mechanic's own estimate."
-        return "Small dents take 1 to 2 days, moderate damage 2 to 4 days, and severe damage 5 to 10 days."
-    if has("insurance", "claim"):
-        return ("For an insurance claim keep clear photos, your policy copy, RC, driving licence, an FIR for major accidents, your report ID "
-                "and a mechanic quotation. The checklist on the Customer page has the full list.")
-    if has("warranty", "guarantee"):
-        return "Ask for a written warranty on paint and parts. Quotations show the warranty each mechanic offers."
-    if has("paint", "colour", "color"):
-        return "Paint work is a big share of the bill. Ask the mechanic to itemise paint separately, as the quote form does."
-    if has("scratch"):
-        return "Light scratches can often be polished or touched up cheaply. Deep scratches that reach metal need paint to prevent rust."
-    if has("dent", "deform"):
-        return "Many dents can be pulled out without repainting (paintless dent repair). Larger creases or stretched metal need panel work."
-    if has("crack", "glass", "windshield"):
-        return "Cracked glass should be checked quickly. Small chips can be repaired, but larger cracks usually need replacement."
-    if has("lamp", "light", "headlight"):
-        return "A broken headlight or tail-lamp affects safety and may fail a check, so replace it soon."
-    if has("pdf", "download", "report", "whatsapp"):
-        return "After sharing your report you can download the PDF and share it on WhatsApp. On the Quotations page you can download the complete repair journey."
-    if has("hello", "hi ", "hey"):
-        return "Hi! Ask me about repair cost, time, safety, insurance or how to choose a quote."
-    return ("I can help with repair cost, repair time, driving safety, insurance claims, warranty and choosing between quotes. "
-            "Try: 'Is this repair worth it?' or 'Which quote should I choose?'")
+        return "Slight damage takes 1 to 2 days, medium 2 to 4 days and severe damage 5 to 10 days."
+    if intent == "insurance":
+        return ("For an insurance claim keep clear photos, the policy copy, RC, driving licence, an FIR for major accidents, your "
+                "report ID and a mechanic quotation. The checklist on the Customer page lists everything.")
+    if intent == "warranty":
+        return "Ask for a written warranty on paint and parts. Each quotation shows the warranty the mechanic offers."
+    if intent == "paint":
+        return "Paint is a big share of the bill. Quotations show paint separately so you can compare it between mechanics."
+    if intent == "scratch":
+        return ("Light scratches can often be polished or touched up cheaply. Deep scratches that reach the metal need sanding and "
+                "repainting to prevent rust.")
+    if intent == "dent":
+        return ("Many dents can be pulled out without repainting (paintless dent repair). Large creases or stretched metal need "
+                "panel beating and paint, and severe ones may need a new panel.")
+    if intent == "crack":
+        return ("Cracked windshields should be checked quickly: small chips can be resin-repaired, larger cracks need replacement. "
+                "Cracks or holes in body panels or bumpers can be welded or patched, or the part is replaced.")
+    if intent == "lamp":
+        return "Broken lamps and bumpers affect safety and may fail a check, so replace them soon. Ask the mechanic for part prices."
+    if intent == "severity":
+        return ("Slight = cosmetic (scratches, small dents). Medium = needs panel work and paint. Severe = major deformation, "
+                "likely panel replacement and a full inspection. It is based on the damage type, its size and how many damages there are.")
+    if intent == "accuracy":
+        return ("The AI only recognises the 7 damage types it was trained on, and a confidence score is not a guarantee. Treat the "
+                "estimate as a guide and confirm it with a mechanic after a physical inspection.")
+    if intent == "review":
+        return "When your repair status reaches Ready, the Quotations page lets you rate the workshop from 1 to 5 stars."
+    if intent == "language":
+        return "Open the ⋮ menu at the top right and choose English, ಕನ್ನಡ or हिन्दी under Language."
+    if intent == "delete":
+        return "On the Quotations page open your report and use '🗑 Delete this report'. It removes the report, quotes and messages for good."
+    if intent == "message":
+        return ("Use '💬 Message this workshop' on a quotation to chat with the mechanic. Phone numbers are shared automatically "
+                "once you select a mechanic, then you can call or WhatsApp them.")
+    if intent == "map":
+        return "Open '🗺 Workshops map' on the Customer page, or '🗺 Where are these workshops?' on Quotations. You can also sort quotes by Nearest."
+    if intent == "pdf":
+        return ("After sharing your report you can download the PDF, show the QR code or share on WhatsApp. On the Quotations page "
+                "you can download the complete repair journey PDF.")
+    if intent == "trouble":
+        return ("Sorry about that. Tell me where it happens: photo upload, analysis, sharing the report, login, quotations or the "
+                "dashboard. Try refreshing the page once. If a red error message appears, tell me what it says.")
+    return None
+
+
+def _assistant_fallback(q, ctx):
+    short = q.strip()[:60]
+    if ctx.get("min_cost") is not None:
+        hint = "You can ask: “Is this repair worth it?”, “How long will it take?”, “Is it safe to drive?” or “Which quote should I choose?”."
+    else:
+        hint = "You can ask: “How do I start a repair?”, “How does this app work?”, “What does severity mean?” or “Why is my photo not detected?”."
+    return (f"I'm not sure I understood “{short}”. I can help with repair cost, repair time, driving safety, insurance, quotes, "
+            f"photo tips and how to use the app. {hint}")
+
+
+def _best_intent(q):
+    """Topic that best matches a typed or spoken question (None if nothing matches)."""
+    t = " " + re.sub(r"\s+", " ", q.lower().strip()) + " "
+    best, best_score = None, 0
+    for name, kws in _INTENTS:
+        sc = _kw_score(t, kws)
+        if sc > best_score:
+            best, best_score = name, sc
+    return best
+
+
+def assistant_rules(q, ctx):
+    """Offline assistant: scores every topic against the question and answers with the best match.
+    Falls back to guidance (never silently repeats one canned answer)."""
+    best = _best_intent(q)
+    if best:
+        ans = _assistant_answer(best, ctx, q)
+        if ans:
+            return ans
+    return _assistant_fallback(q, ctx)
 
 
 def assistant_llm(q, ctx, history):
@@ -1026,28 +1213,129 @@ def assistant_reply(q, ctx, history):
     return assistant_rules(q, ctx)
 
 
+# Tap-only assistant: the user picks from fixed options, so every choice has a clear answer.
+ASSIST_LABELS = {
+    "start": "🚗 I want to repair my car",
+    "worth": "✅ Is this repair worth it?",
+    "cost": "💰 How much will it cost?",
+    "time": "🕒 How long will the repair take?",
+    "drive": "🚦 Is it safe to drive?",
+    "choose_quote": "🧾 Which quote should I choose?",
+    "quotes_flow": "📨 Where do I see mechanic quotes?",
+    "upload": "📸 Photo tips / damage not detected",
+    "insurance": "🛡 Insurance claim help",
+    "howapp": "ℹ️ How does this app work?",
+    "dashboard": "📊 Dashboard help",
+    "severity": "⚠️ What does severity mean?",
+    "accuracy": "🎯 How accurate is the AI?",
+    "warranty": "🔧 Warranty on repairs",
+    "reportid": "🔑 I lost my Report ID",
+    "account": "👤 Mechanic login / register",
+    "mech_quote": "📝 How do mechanics send quotes?",
+    "message": "💬 How do I contact a mechanic?",
+    "map": "🗺 Find workshops near me",
+    "language": "🌐 Change language",
+    "delete": "🗑 Delete my report",
+    "pdf": "📄 Download / share my report",
+    "review": "⭐ Rate the workshop",
+    "paint": "🎨 About paint work",
+    "scratch": "〰️ About scratches",
+    "dent": "🔨 About dents",
+    "crack": "🪟 Cracks, holes and windshield",
+    "lamp": "💡 Lamps and bumpers",
+}
+ASSIST_MAIN = ["start", "cost", "time", "drive", "choose_quote", "upload", "insurance", "howapp", "dashboard"]
+ASSIST_MORE = ["severity", "accuracy", "warranty", "reportid", "account", "mech_quote", "message", "map",
+               "pdf", "review", "language", "delete", "paint", "scratch", "dent", "crack", "lamp"]
+ASSIST_NEXT = {   # follow-up options shown after each answer
+    "start": ["upload", "cost", "howapp"], "worth": ["cost", "time", "choose_quote"],
+    "cost": ["time", "worth", "choose_quote"], "time": ["cost", "drive", "insurance"],
+    "drive": ["time", "cost", "insurance"], "choose_quote": ["message", "warranty", "map"],
+    "quotes_flow": ["choose_quote", "message", "reportid"], "upload": ["start", "accuracy", "howapp"],
+    "insurance": ["pdf", "cost", "warranty"], "howapp": ["start", "dashboard", "account"],
+    "dashboard": ["howapp", "account", "start"], "severity": ["cost", "time", "drive"],
+    "accuracy": ["upload", "cost", "severity"], "warranty": ["choose_quote", "paint", "insurance"],
+    "reportid": ["quotes_flow", "pdf", "start"], "account": ["mech_quote", "howapp", "dashboard"],
+    "mech_quote": ["account", "message", "dashboard"], "message": ["choose_quote", "map", "quotes_flow"],
+    "map": ["choose_quote", "message", "quotes_flow"], "language": ["howapp", "start", "dashboard"],
+    "delete": ["reportid", "start", "pdf"], "pdf": ["insurance", "quotes_flow", "reportid"],
+    "review": ["warranty", "choose_quote", "howapp"], "paint": ["cost", "scratch", "warranty"],
+    "scratch": ["cost", "paint", "dent"], "dent": ["cost", "worth", "time"],
+    "crack": ["drive", "cost", "time"], "lamp": ["drive", "cost", "insurance"],
+}
+
+
+def _assistant_pick(key, intent, ctx):
+    hist = st.session_state.setdefault(f"chat_{key}", [])
+    hist.append({"role": "user", "content": ASSIST_LABELS[intent]})
+    hist.append({"role": "assistant", "content": _assistant_answer(intent, ctx, "") or "Please ask a mechanic about this."})
+    st.session_state[f"assist_last_{key}"] = intent
+    st.session_state[f"assist_more_{key}"] = False
+
+
 def render_assistant(key, ctx):
-    hist_key = f"chat_{key}"
+    """Tap-only assistant: no typing, the user chooses from a short list of questions."""
+    hist_key, last_key, more_key = f"chat_{key}", f"assist_last_{key}", f"assist_more_{key}"
     st.session_state.setdefault(hist_key, [])
     hist = st.session_state[hist_key]
-    if not hist:
-        st.caption("Try: “Is this repair worth it?”, “How long will it take?”, “Which quote should I choose?”")
-    for m in hist[-8:]:
+    last = st.session_state.get(last_key)
+    show_more = st.session_state.get(more_key, False)
+
+    for m in hist[-6:]:
         with st.chat_message(m["role"]):
             st.write(m["content"])
+
+    if last:
+        st.markdown("**Related questions**")
+        options = ASSIST_NEXT.get(last, ASSIST_MAIN[:3])
+    elif show_more:
+        st.markdown("**More topics**")
+        options = ASSIST_MORE
+    else:
+        st.markdown("**Choose a question**")
+        options = list(ASSIST_MAIN)
+        if ctx.get("min_cost") is not None:               # photo already analysed: put the personal questions first
+            options = ["worth"] + [o for o in options if o != "start"][:8]
+        if ctx.get("quotes"):
+            options = ["choose_quote"] + [o for o in options if o != "choose_quote"][:8]
+
+    cols = st.columns(2)
+    for i, intent in enumerate(options):
+        if cols[i % 2].button(ASSIST_LABELS[intent], key=f"opt_{key}_{intent}_{last}_{show_more}",
+                              use_container_width=True):
+            _assistant_pick(key, intent, ctx)
+            st.rerun()
+
+    nav = st.columns(2)
+    if not last and not show_more:
+        if nav[0].button("➕ More topics", key=f"more_{key}", use_container_width=True):
+            st.session_state[more_key] = True
+            st.rerun()
+    else:
+        if nav[0].button("🏠 Main menu", key=f"home_{key}", use_container_width=True):
+            st.session_state[last_key] = None
+            st.session_state[more_key] = False
+            st.rerun()
+    if hist and nav[1].button("🧹 Clear chat", key=f"clear_{key}", use_container_width=True):
+        st.session_state[hist_key] = []
+        st.session_state[last_key] = None
+        st.session_state[more_key] = False
+        st.rerun()
+
+    st.markdown("**Or type / speak your own question**")
     voice_lang = {"English": "en-IN", "ಕನ್ನಡ": "kn-IN", "हिन्दी": "hi-IN"}.get(st.session_state.get("lang", "English"), "en-IN")
     components.html(VOICE_HTML.replace("__LANG__", voice_lang), height=48)
     with st.form(f"assistant_form_{key}", clear_on_submit=True):
         question = st.text_input(tr("Ask about your repair…"), key=f"assistant_q_{key}")
         sent = st.form_submit_button(tr("SEND"), use_container_width=True)
     if sent and question.strip():
-        hist.append({"role": "user", "content": question.strip()})
+        q = question.strip()
+        hist.append({"role": "user", "content": q})
         with st.spinner("Thinking…"):
-            answer = assistant_reply(question.strip(), ctx, hist)
+            answer = assistant_reply(q, ctx, hist)
         hist.append({"role": "assistant", "content": answer})
-        st.rerun()
-    if hist and st.button(tr("Clear chat"), key=f"assistant_clear_{key}"):
-        st.session_state[hist_key] = []
+        st.session_state[last_key] = _best_intent(q)      # show related options if the topic was understood
+        st.session_state[more_key] = False
         st.rerun()
 
 
@@ -1110,7 +1398,7 @@ def render_admin_dashboard():
             st.markdown(tr("**Repair status**"))
             order = ["Open", "Selected", "Car dropped", "In repair", "Ready"]
             st.bar_chart(reports["repair_status"].value_counts().reindex(order, fill_value=0))
-        days = pd.to_datetime(reports["created"].str[:10], format="%d-%m-%Y", errors="coerce").dropna().dt.date
+        days = pd.to_datetime(pd.Series([parse_ts(v) for v in reports["created"]]), errors="coerce").dropna().dt.date
         if len(days):
             st.markdown(tr("**Reports per day**"))
             st.line_chart(days.value_counts().sort_index())
@@ -1254,7 +1542,7 @@ def render_thread(report_id, mechanic_id, role, key, block_phone=True):
     for r in rows[-20:]:
         mine = r["sender"] == role
         with st.chat_message("user" if mine else "assistant"):
-            st.caption(f"{'You' if mine else other} • {r['created']}")
+            st.caption(f"{'You' if mine else other} • {pretty_ts(r['created'])}")
             st.text(r["body"])
     with st.form(f"msg_form_{key}", clear_on_submit=True):
         body = st.text_area(tr("Your message"), max_chars=500, height=80, key=f"msg_body_{key}")
@@ -1389,12 +1677,60 @@ def looks_like_vehicle(image_bytes):
         return None
 
 
+# ------------------------- PHONE IMAGE HANDLING -------------------------
+
+try:                                                 # HEIC / HEIF support (iPhone and some Android cameras)
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIF_OK = True
+except Exception:
+    HEIF_OK = False
+
+PHONE_TYPES = ["jpg", "jpeg", "jfif", "png", "webp", "bmp", "heic", "heif"]
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def prepare_image(raw):
+    """Return (jpeg_bytes, width, height): upright, RGB, at most 1600 px. Raises ValueError with a clear message."""
+    if not raw:
+        raise ValueError("The file is empty. Please select the photo again.")
+    try:
+        img = Image.open(BytesIO(raw))
+        img.load()
+    except Exception:
+        hint = "" if HEIF_OK else " HEIC/HEIF photos need the pillow-heif package; set the phone camera to JPEG or add pillow-heif."
+        raise ValueError("This file could not be read as an image." + hint)
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    else:
+        img = img.convert("RGB")
+    if max(img.size) > 1600:
+        img.thumbnail((1600, 1600))
+    buf = BytesIO()
+    img.save(buf, "JPEG", quality=90)
+    return buf.getvalue(), img.width, img.height
+
+
+def go_to_quotes():
+    """Button callback: open Quotations for the report the customer just shared (no retyping)."""
+    last = st.session_state.get("last_report")
+    if last:
+        st.session_state.quotation_report_id = last["id"]
+    st.session_state.page = "Quotations"
+
+
 # ------------------------- CUSTOMER PAGE -------------------------
 
 def render_customer():
     st.markdown('<div class="section-heading">CUSTOMER WORKSPACE</div>', unsafe_allow_html=True)
     st.title(tr("Vehicle Damage Inspection"))
     st.write("Upload a clear vehicle image and let the trained AI model analyse visible damage.")
+    st.info("👤 **For vehicle owners.** Upload a photo → check the AI result → share your report. "
+            "Then open **Quotations** to compare mechanic offers. You do not need to register.")
 
     with st.expander(tr("📂 My previous reports")):
         hist_phone = st.text_input(tr("Enter your 10-digit phone number"), key="hist_phone")
@@ -1405,7 +1741,7 @@ def render_customer():
                 FROM reports r WHERE r.phone = ? ORDER BY r.id DESC""", (hist_phone.strip(),)).fetchall()
             conn.close()
             if rows:
-                st.dataframe([{"Report ID": r["id"], "Date": r["created"], "Vehicle": r["vehicle"],
+                st.dataframe([{"Report ID": r["id"], "Date": pretty_ts(r["created"]), "Vehicle": r["vehicle"],
                                "Damage": str(r["damage"]).replace("_", " ").title(), "Severity": r["severity"],
                                "Quotes": r["qcount"], "Repair status": r["repair_status"] or "Open"}
                               for r in rows], use_container_width=True, hide_index=True)
@@ -1457,10 +1793,9 @@ def render_customer():
 
     chat_ctx = {}
     if analysis and analysis.get("detections"):
-        p_name = analysis["detections"][0]["name"]
-        p_sev, _ = assess_severity(p_name)
-        p_lo, p_hi = estimate_repair_cost(p_name)
-        chat_ctx = {"damage": p_name.replace("_", " "), "severity": p_sev, "min_cost": p_lo, "max_cost": p_hi}
+        _e = get_estimate(analysis["detections"])
+        chat_ctx = {"damage": _e["primary"].replace("_", " "), "severity": _e["severity"],
+                    "min_cost": _e["min"], "max_cost": _e["max"]}
     with st.expander(tr("💬 Ask the AutoVision assistant")):
         render_assistant("customer", chat_ctx)
     with st.expander(tr("🗺 Workshops map")):
@@ -1471,48 +1806,63 @@ def render_customer():
     left, right = st.columns([1, 1.05], gap="large")
 
     with left:
-        upload = st.file_uploader(tr("Upload vehicle image"), type=["jpg", "jpeg", "png"],
+        upload = st.file_uploader(tr("Upload vehicle image"), type=PHONE_TYPES,
                                   key=f"customer_vehicle_upload_{st.session_state.up_n}")
+        st.caption("Tap the box, then choose Gallery / Photos or Camera. JPG, PNG, WEBP and HEIC photos are supported.")
+        with st.expander("📷 Use the camera instead"):
+            cam_file = st.camera_input("Take a photo of the damage", key=f"customer_camera_{st.session_state.up_n}")
+        source = upload if upload is not None else cam_file
         confidence = st.slider(tr("Detection confidence"), 0.25, 0.90, 0.50, 0.05,
                                help="A higher threshold may reduce weak detections but can miss real damage.")
-        extra_files = st.file_uploader(tr("➕ Add more angles (optional, up to 3)"), type=["jpg", "jpeg", "png"],
+        extra_files = st.file_uploader(tr("➕ Add more angles (optional, up to 3)"), type=PHONE_TYPES,
                                        accept_multiple_files=True,
                                        key=f"customer_extra_upload_{st.session_state.up_n}") or []
         extra_files = extra_files[:3]
-        image_bytes = upload.getvalue() if upload else None
-        analysed_now = bool(analysis and upload and analysis["file_name"] == upload.name)
+        image_bytes, upload_error, file_id, img_w, img_h = None, None, None, 0, 0
+        src_name = getattr(source, "name", "photo.jpg") if source else None
+        if source is not None:
+            try:
+                image_bytes, img_w, img_h = prepare_image(source.getvalue())
+                file_id = hashlib.md5(image_bytes).hexdigest()
+            except ValueError as exc:
+                upload_error = str(exc)
+        extra_prepared = []
+        for f in extra_files:
+            try:
+                extra_prepared.append((f.name, prepare_image(f.getvalue())[0]))
+            except ValueError as exc:
+                st.warning(f"{f.name}: {exc}")
+        analysed_now = bool(analysis and image_bytes and analysis.get("file_id") == file_id)
 
-        active = 3 if last else 2 if analysed_now else 1 if upload else 0
+        active = 3 if last else 2 if analysed_now else 1 if image_bytes else 0
         step_bar([tr("Upload"), tr("Analyse"), tr("Share report")], active)
 
-        if image_bytes:
+        if upload_error:
+            st.error(f"❌ {upload_error}")
+        elif image_bytes:
+            st.success(f"✅ Photo ready: {img_w}×{img_h}px, {len(image_bytes) // 1024} KB")
             for note in check_quality(image_bytes):
                 st.warning(f"Photo looks {note}. A clearer photo gives a better result.")
             if not analysed_now:
-                try:
-                    st.image(load_image(image_bytes),
-                             caption="Uploaded vehicle image", use_container_width=True)
-                except Exception:
-                    st.error("This image could not be opened.")
+                st.image(image_bytes, caption=f"Uploaded vehicle image ({src_name})", use_container_width=True)
 
         if st.button(tr("⚡ ANALYSE VEHICLE DAMAGE"), key="analyse_vehicle"):
-            if not image_bytes:
+            if upload_error:
+                st.error(f"❌ {upload_error}")
+            elif not image_bytes:
                 st.warning(tr("Upload a vehicle image first."))
             else:
                 try:
                     with st.spinner("AI is scanning your vehicle..."):
                         shots = []
-                        for nm, data in [(upload.name, image_bytes)] + [(f.name, f.getvalue()) for f in extra_files]:
+                        for nm, data in [(src_name, image_bytes)] + extra_prepared:
                             _, ann, dets = analyse_vehicle(data, confidence)
-                            cost = 0
-                            if dets:
-                                _lo, _hi = estimate_repair_cost(dets[0]["name"])
-                                cost = _hi or _lo or 0
+                            cost = get_estimate(dets)["max"] if dets else 0
                             shots.append({"name": nm, "bytes": data, "annotated": ann, "detections": dets, "cost": cost})
                         main_idx = max(range(len(shots)), key=lambda i: shots[i]["cost"])
                         main = shots[main_idx]
                     st.session_state.customer_analysis = {
-                        "file_name": upload.name, "image_bytes": main["bytes"],
+                        "file_name": src_name, "file_id": file_id, "image_bytes": main["bytes"],
                         "annotated": main["annotated"], "detections": main["detections"],
                         "shots": shots, "main_idx": main_idx}
                     st.session_state.pop("last_report", None)
@@ -1566,9 +1916,10 @@ def render_customer():
                                        for d in sh["detections"]) or "No damage detected in this angle.")
         if analysis["detections"][0].get("low_conf"):
             st.warning("Damage found only at a lower confidence (0.30). Please verify it manually.")
-        primary = analysis["detections"][0]["name"]
-        severity, description = assess_severity(primary)
-        min_cost, max_cost = estimate_repair_cost(primary)
+        est = get_estimate(analysis["detections"])
+        primary = est["primary"]
+        severity, description = est["severity"], est["description"]
+        min_cost, max_cost = est["min"], est["max"]
         kind = sev_kind(severity)
 
         st.markdown(
@@ -1582,6 +1933,16 @@ def render_customer():
             st.progress(min(item["confidence"], 1.0),
                         text=f"{item['name'].replace('_', ' ').title()} — {item['confidence'] * 100:.0f}% confidence")
         st.info(description)
+        if est.get("safety"):
+            st.warning("⚠️ " + est["safety"])
+        if est["items"]:
+            with st.expander("🧮 How this estimate was calculated"):
+                st.dataframe([{"Damage": it["label"], "Detected as": it["class"].replace("_", " "),
+                               "Action": it["action"], "Severity": f"{it['s'] * 100:.0f}%",
+                               "Estimate": f"{money(it['lo'])} – {money(it['hi'])}"} for it in est["items"]],
+                             use_container_width=True, hide_index=True)
+                st.caption(f"Based on the damaged part, the size of each damage, repair vs replacement, labour "
+                           f"(Rs {LABOUR_RATE}/hour), paint, and the number of damages repaired together.")
         d_lo, d_hi = repair_time(severity)
         st.markdown(f"🕒 **Estimated repair time:** {d_lo} to {d_hi} days")
         st.markdown(f"🚦 **Driving advice:** {drive_tip(severity)}")
@@ -1592,8 +1953,9 @@ def render_customer():
         with st.form("customer_report_submission"):
             c1, c2 = st.columns(2)
             with c1:
-                customer = st.text_input(tr("Customer name"))
-                phone = st.text_input(tr("10-digit phone number"))
+                customer = st.text_input(tr("Customer name"), placeholder="Your full name")
+                phone = st.text_input(tr("10-digit phone number"), placeholder="9876543210",
+                                      help="Your mobile number without +91. You need it again on the Quotations page.")
                 make = st.selectbox(tr("Vehicle make"), CAR_MAKES)
             with c2:
                 area_pick = st.selectbox(tr("Area in Bengaluru"), BENGALURU_AREAS)
@@ -1607,8 +1969,10 @@ def render_customer():
 
         if submitted:
             area = area_other.strip() if area_pick == "Other" else area_pick
-            if not all([customer.strip(), phone.strip(), area, (model.strip() or vsel != "New vehicle")]):
-                st.error(tr("Please complete all fields."))
+            missing = [n for n, ok in [("your name", customer.strip()), ("phone number", phone.strip()),
+                                       ("area", area), ("vehicle model", model.strip() or vsel != "New vehicle")] if not ok]
+            if missing:
+                st.error("Please fill in: " + ", ".join(missing) + ".")
             elif not phone.strip().isdigit() or len(phone.strip()) != 10:
                 st.error(tr("Enter a valid 10-digit phone number."))
             else:
@@ -1641,6 +2005,10 @@ def render_customer():
                 f"<div class='small-note'>Keep this ID and your phone number to check quotations.</div></div>",
                 unsafe_allow_html=True)
             st.code(str(last["id"]), language=None)
+            st.success("✅ Your report is shared with mechanics in your area.")
+            st.markdown("**What happens next**  \n1. Mechanics near you send quotations  \n"
+                        "2. Open **Quotations** (button below) to compare them  \n3. Select a mechanic and track the repair")
+            st.button("➡ Go to Quotations", key="go_quotes_btn", on_click=go_to_quotes, use_container_width=True)
             share_msg = (f"AutoVision AI report #{last['id']}: {last['vehicle']}, "
                          f"{str(last['damage']).replace('_', ' ')}, severity {last['severity']}. "
                          f"AI estimate Rs {int(last['min_cost'] or 0):,} - Rs {int(last['max_cost'] or 0):,}.")
@@ -1676,14 +2044,19 @@ def render_mechanic():
     st.markdown('<div class="section-heading">SERVICE PARTNER WORKSPACE</div>', unsafe_allow_html=True)
     st.title(tr("Mechanic Portal"))
     st.write("Register your workshop or log in to receive customer reports and submit quotations.")
+    st.info("🔧 **For workshop owners only.** Register once, then log in to see customer requests and send quotations. "
+            "Customers do not need to register here.")
+    step_bar(["Register", "Log in", "Send quotes", "Update repair"],
+             2 if st.session_state.get("mechanic_id") is not None else 0)
     st.session_state.setdefault("mechanic_id", None)
 
     if st.session_state.mechanic_id is None:
+        st.caption("New workshop? Use **Register Workshop** once. Already registered? Open **Mechanic Login**.")
         reg_tab, login_tab = st.tabs([tr("Register Workshop"), tr("Mechanic Login")])
         with reg_tab:
             with st.form("mechanic_registration_form"):
                 name = st.text_input(tr("Mechanic / workshop name"))
-                phone = st.text_input(tr("Mobile number"))
+                phone = st.text_input(tr("Mobile number"), placeholder="9876543210", help="10-digit mobile number without +91. You will use it to log in.")
                 area = st.selectbox(tr("Workshop area"), BENGALURU_AREAS)
                 area_other = st.text_input(tr("If other, type your area"))
                 password = st.text_input(tr("Create password"), type="password")
@@ -1712,7 +2085,7 @@ def render_mechanic():
                         conn.close()
         with login_tab:
             with st.form("mechanic_login_form"):
-                phone_login = st.text_input(tr("Registered phone number"))
+                phone_login = st.text_input(tr("Registered phone number"), placeholder="9876543210", help="The mobile number you registered with.")
                 password_login = st.text_input(tr("Password"), type="password")
                 login = st.form_submit_button(tr("LOGIN"), use_container_width=True)
             if login:
@@ -1857,7 +2230,7 @@ def render_mechanic():
                 st.write(f"**Vehicle:** {rep['vehicle']}")
                 st.write(f"**Damage:** {str(rep['damage']).replace('_', ' ').title()}")
                 st.write(f"**AI estimate:** {money(rep['min_cost'])} – {money(rep['max_cost'])}")
-                st.write(f"**Submitted:** {rep['created']}")
+                st.write(f"**Submitted:** {pretty_ts(rep['created'])}")
                 if state == "Won":
                     st.success(f"Customer: {rep['customer']}  •  📞 {rep['phone']}")
                 else:
@@ -1901,6 +2274,8 @@ def render_mechanic():
             def pv(col, default):
                 return mine[col] if mine and mine[col] is not None else default
 
+            st.caption(f"AI estimate for this report: {money(rep['min_cost'])} – {money(rep['max_cost'])}. "
+                       "Your total = parts + labour + paint.")
             with st.form(f"mechanic_quote_{rep['id']}"):
                 q1, q2, q3 = st.columns(3)
                 parts = q1.number_input(tr("Parts (₹)"), 0, step=100, value=int(pv("parts", 0)))
@@ -1972,13 +2347,27 @@ def render_quotations():
     st.markdown('<div class="section-heading">REPAIR PRICE COMPARISON</div>', unsafe_allow_html=True)
     st.title(tr("Compare Mechanic Quotations"))
     st.write("Use your report ID and customer phone number to view submitted quotations.")
+    st.info("🧾 **For vehicle owners.** Enter the Report ID you received on the Customer page and the same phone number "
+            "you used there.")
+    _qid = st.session_state.get("quotation_report_id")
+    _active = 0
+    if _qid:
+        _c = db_connect()
+        _won = _c.execute("SELECT COUNT(*) FROM quotes WHERE report_id = ? AND selected = 1", (_qid,)).fetchone()[0]
+        _st = _c.execute("SELECT repair_status FROM reports WHERE id = ?", (_qid,)).fetchone()
+        _c.close()
+        _active = 4 if (_st and _st[0] == "Ready") else 3 if _won else 1
+    step_bar(["Enter Report ID", "Compare quotes", "Select mechanic", "Track repair"], _active)
+    _last = st.session_state.get("last_report") or {}
     if "flash_q" in st.session_state:
         st.success(st.session_state.pop("flash_q"))
 
     with st.form("quotation_lookup_form"):
         c1, c2 = st.columns(2)
-        report_id_input = c1.number_input(tr("Damage Report ID"), min_value=1, step=1)
-        phone_input = c2.text_input(tr("Customer phone number"))
+        report_id_input = c1.number_input(tr("Damage Report ID"), min_value=1, step=1, value=int(_last.get("id", 1)),
+                                          help="The number shown after you shared your report (also in your PDF).")
+        phone_input = c2.text_input(tr("Customer phone number"), value=_last.get("phone", ""), placeholder="9876543210",
+                                    help="The same phone number you entered when sharing the report.")
         lookup = st.form_submit_button(tr("FIND QUOTATIONS"), use_container_width=True)
 
     if lookup:
@@ -2043,6 +2432,26 @@ def render_quotations():
     if not quotes:
         st.info(tr("No quotations received yet. Please check again later."))
         return
+
+    # In-app notifications: new quotations / mechanic messages since the customer last looked
+    notif_key = f"notif_{report_id}"
+    unseen_q = [q for q in quotes if not q["seen"]]
+    conn = db_connect()
+    unseen_m = conn.execute("""SELECT COUNT(*) FROM messages WHERE report_id = ? AND sender = 'mechanic'
+                               AND COALESCE(seen, 0) = 0""", (report_id,)).fetchone()[0]
+    if unseen_q or unseen_m:
+        bits = []
+        if unseen_q:
+            bits.append(f"{len(unseen_q)} new quotation(s) from " + ", ".join(q["name"] for q in unseen_q))
+        if unseen_m:
+            bits.append(f"{unseen_m} new message(s) from mechanics")
+        st.session_state[notif_key] = "🔔 " + "  •  ".join(bits)
+        conn.execute("UPDATE quotes SET seen = 1 WHERE report_id = ?", (report_id,))
+        conn.execute("UPDATE messages SET seen = 1 WHERE report_id = ? AND sender = 'mechanic'", (report_id,))
+        conn.commit()
+    conn.close()
+    if st.session_state.get(notif_key):
+        st.info(st.session_state[notif_key])
 
     chosen = next((q for q in quotes if q["selected"]), None)
     if chosen:
