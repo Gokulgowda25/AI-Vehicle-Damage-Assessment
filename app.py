@@ -464,9 +464,28 @@ div[data-testid="stVerticalBlockBorderWrapper"]:has(.portal-card-wrap):hover { t
 .band-pin { position:absolute; top:-4px; width:4px; height:16px; background:#ff4b57; border-radius:2px; transform:translateX(-2px); }
 .link-btn { display:inline-block; margin:8px 8px 0 0; padding:8px 14px; border-radius:8px; background:#18181b; border:1px solid #ff303b; color:#fff !important; text-decoration:none; font-weight:700; font-size:13px; }
 .link-btn:hover { background:#3b080d; }
-/* THREE-DOTS MENU */
-[data-testid="stPopover"] button, details[data-testid="stExpander"] > summary.menu-dots { min-width:46px; height:46px; padding:0 !important; font-size:24px !important; font-weight:900 !important; border-radius:10px; line-height:1; }
-[data-testid="stPopoverBody"] { background:#101012 !important; border:1px solid #64202c !important; border-radius:12px; min-width:300px; }
+/* THREE-DOTS MENU (polished) */
+[data-testid="stPopover"] { display:flex; justify-content:flex-end; }
+[data-testid="stPopover"] button { width:48px !important; min-width:48px !important; height:48px !important; padding:0 !important; border-radius:50% !important; background:linear-gradient(145deg,#1d1d21,#0d0d0f) !important; border:1.5px solid #ff303b !important; color:#fff !important; box-shadow:0 4px 14px rgba(0,0,0,.65), 0 0 0 0 rgba(255,48,59,.5) !important; transition:transform .25s ease, box-shadow .25s ease, background .25s ease !important; }
+[data-testid="stPopover"] button p { margin:0 !important; font-size:26px !important; font-weight:900 !important; line-height:1 !important; }
+[data-testid="stPopover"] button svg, [data-testid="stPopover"] button [data-testid="stIconMaterial"] { display:none !important; }
+[data-testid="stPopover"] button:hover { transform:rotate(90deg) scale(1.07); background:linear-gradient(145deg,#3b080d,#160507) !important; box-shadow:0 0 20px rgba(255,48,59,.7) !important; }
+[data-testid="stPopoverBody"] { background:linear-gradient(180deg,#151517,#0b0b0d) !important; border:1px solid #64202c !important; border-radius:16px !important; box-shadow:0 18px 50px rgba(0,0,0,.75), 0 0 0 1px rgba(255,48,59,.15) !important; min-width:310px; max-width:92vw; max-height:78vh; overflow-y:auto; padding:14px !important; }
+[data-testid="stPopoverBody"] hr { border-color:#2a2a2e !important; margin:10px 0 !important; }
+[data-testid="stPopoverBody"] .stButton > button { justify-content:flex-start !important; text-align:left !important; background:transparent !important; border:1px solid transparent !important; color:#f1eef0 !important; font-weight:600 !important; font-size:14px !important; text-transform:none !important; letter-spacing:0 !important; padding:9px 12px !important; border-radius:10px !important; box-shadow:none !important; transition:background .2s ease, transform .2s ease, border-color .2s ease !important; }
+[data-testid="stPopoverBody"] .stButton > button:hover { background:#2a0b0f !important; border-color:#ff303b !important; transform:translateX(3px); }
+[data-testid="stPopoverBody"] .st-key-menu_logout button { color:#ff6b75 !important; }
+[data-testid="stPopoverBody"] .st-key-menu_reset button { color:#9a9498 !important; }
+[data-testid="stPopoverBody"] [data-testid="stForm"] { border:1px solid #2e2e33 !important; border-radius:12px !important; padding:12px !important; background:#101012; }
+[data-testid="stPopoverBody"] [data-testid="stForm"] button { justify-content:center !important; background:linear-gradient(135deg,#e10e20,#9d0814) !important; border:1px solid #ff303b !important; color:#fff !important; font-weight:800 !important; }
+[data-testid="stPopoverBody"] [data-testid="stExpander"] { border:1px solid #2e2e33 !important; border-radius:12px !important; background:#101012; }
+.mn-head { display:flex; gap:12px; align-items:center; padding:12px; border-radius:14px; background:linear-gradient(135deg,#2a0b0f,#151517); border:1px solid #4a1a20; margin-bottom:6px; }
+.mn-avatar { width:46px; height:46px; border-radius:50%; background:linear-gradient(145deg,#ff4b57,#a1101b); color:#fff; font-weight:900; font-size:20px; display:flex; align-items:center; justify-content:center; box-shadow:0 0 14px rgba(255,48,59,.5); flex:none; }
+.mn-name { font-weight:800; font-size:15px; color:#fff; line-height:1.2; }
+.mn-sub { font-size:12px; color:#a8a2a5; margin:2px 0 5px; }
+.mn-pill { display:inline-block; font-size:10.5px; letter-spacing:1px; padding:2px 9px; border-radius:999px; background:#1d1d21; color:#bdb8ba; border:1px solid #3a3a40; font-weight:700; }
+.mn-pill.on { background:#0f2a18; color:#6fe39a; border-color:#1f6b3a; }
+.mn-section { font-size:11px; letter-spacing:2px; font-weight:800; color:#ff4b57; margin:4px 2px 4px; }
 /* NAV FIX: Streamlit header overlay was blocking clicks on the top buttons */
 header[data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"] { display:none !important; }
 .block-container { padding-top:1rem !important; }
@@ -554,11 +573,16 @@ def render_account_menu():
         box = st.expander(tr("⋮ Menu"))
 
     with box:
-        if mech:
-            st.markdown(f"**👤 {mech['name']}**  \n📍 {mech['area']}  •  📞 {mech['phone']}")
-            st.caption(tr("Signed in as mechanic"))
-        else:
-            st.markdown(tr("**👋 Welcome, guest**"))
+        from html import escape as _esc
+        h_name = mech["name"] if mech else "Guest"
+        h_sub = f"{mech['area']}  •  {mech['phone']}" if mech else "Not signed in"
+        h_pill = "MECHANIC" if mech else "GUEST"
+        st.markdown(
+            f"<div class='mn-head'><div class='mn-avatar'>{_esc(h_name[:1].upper())}</div>"
+            f"<div><div class='mn-name'>{_esc(h_name)}</div><div class='mn-sub'>{_esc(h_sub)}</div>"
+            f"<span class='mn-pill{' on' if mech else ''}'>{h_pill}</span></div></div>",
+            unsafe_allow_html=True)
+        if not mech:
             st.caption(tr("Not signed in. Customers do not need to log in."))
         st.divider()
 
@@ -583,7 +607,7 @@ def render_account_menu():
                       use_container_width=True)
         st.divider()
 
-        st.caption(tr("QUICK LINKS"))
+        st.markdown(f"<div class='mn-section'>{tr('QUICK LINKS')}</div>", unsafe_allow_html=True)
         st.button(tr("📷 New damage inspection"), key="menu_new", on_click=go_to_page, args=("Customer",),
                   use_container_width=True)
         st.button(tr("📂 My reports and history"), key="menu_hist", on_click=go_to_page, args=("Customer",),
